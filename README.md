@@ -177,3 +177,23 @@ cd pkgbuild && makepkg -si
 MIT
 
 DeepSeek Harness 本身由 DeepSeek 开发。本项目是独立的社区项目，不是 DeepSeek 官方产品，与 DeepSeek 无隶属关系。
+
+## 升级（WU-HINS 说明）
+
+仓库内提供了 `scripts/dsh-update.sh`：直接消费上游 release，不重新构建。
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/WU-HINS/dsh-desktop-linux/master/scripts/dsh-update.sh
+chmod +x dsh-update.sh
+./dsh-update.sh --check          # 只看有没有新版本
+sudo ./dsh-update.sh             # 升级（自动选 deb/appimage/rpm/arch）
+```
+
+行为要点：
+
+- 默认源为 `ffyfox/dsh-desktop-linux`（本仓库的上游），可用 `--repo=` 换成 `WU-HINS/dsh-desktop-linux` 以使用带 GPG 签名的构建。
+- 版本比较支持 `0.2.1~rc.2`、`0.2.2rc5`、`0.2.2-rc.5` 这类写法，`rc` 之间按数字比较。
+- 下载后用 release 的 `SHA256SUMS`/`SHA256SUMS.txt` 校验；若同目录存在 `.asc` 与 `PUBKEY.asc`，额外做 GPG 验签。
+- deb/rpm/arch 走系统包管理器；AppImage 装到 `~/Applications/DeepSeek-Harness.AppImage`，旧版本保留为 `.prev`。
+- `--tag=v0.2.2rc5` 可指定版本（回滚），`--dry-run` 只下载校验不安装。
+
