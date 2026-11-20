@@ -35,6 +35,57 @@ die() { printf 'dsh-update: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
+if [[ "${1:-}" == "--compare" ]]; then
+  normalize_version() {
+    local v="${1#v}"
+    v="${v//\~/-}"
+    v="$(printf '%s' "$v" | sed -E 's/([A-Za-z])([0-9])/\1.\2/g; s/^([0-9][^-]*[0-9])([A-Za-z].*)$/\1-\2/')"
+    printf '%s' "$v"
+  }
+  compare_tokens() {
+    local a="$1" b="$2"
+    if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+      if (( 10#$a < 10#$b )); then echo -1; elif (( 10#$a > 10#$b )); then echo 1; else echo 0; fi
+      return
+    fi
+    [[ "$a" =~ ^[0-9]+$ ]] && { echo -1; return; }
+    [[ "$b" =~ ^[0-9]+$ ]] && { echo 1; return; }
+    if [[ "$a" < "$b" ]]; then echo -1; elif [[ "$a" > "$b" ]]; then echo 1; else echo 0; fi
+  }
+  version_cmp() {
+    local a b amain apre bmain bpre
+    a="$(normalize_version "$1")"; b="$(normalize_version "$2")"
+    amain="${a%%-*}"; apre=""; [[ "$a" == *-* ]] && apre="${a#*-}"
+    bmain="${b%%-*}"; bpre=""; [[ "$b" == *-* ]] && bpre="${b#*-}"
+    local i x y
+    for i in 1 2 3; do
+      x="$(cut -d. -f"$i" <<<"$amain")"; y="$(cut -d. -f"$i" <<<"$bmain")"
+      x="${x:-0}"; y="${y:-0}"
+      if (( 10#$x < 10#$y )); then echo -1; return; fi
+      if (( 10#$x > 10#$y )); then echo 1; return; fi
+    done
+    if [[ -z "$apre" && -z "$bpre" ]]; then echo 0; return; fi
+    if [[ -z "$apre" ]]; then echo 1; return; fi
+    if [[ -z "$bpre" ]]; then echo -1; return; fi
+    local -a at bt
+    IFS='.-' read -r -a at <<<"$apre"
+    IFS='.-' read -r -a bt <<<"$bpre"
+    local n=${#at[@]}
+    (( ${#bt[@]} > n )) && n=${#bt[@]}
+    for (( i = 0; i < n; i++ )); do
+      x="${at[i]:-}"; y="${bt[i]:-}"
+      if [[ -z "$x" && -z "$y" ]]; then break; fi
+      if [[ -z "$x" ]]; then echo -1; return; fi
+      if [[ -z "$y" ]]; then echo 1; return; fi
+      local c; c="$(compare_tokens "$x" "$y")"
+      if [[ "$c" != 0 ]]; then echo "$c"; return; fi
+    done
+    echo 0
+  }
+  echo "cmp(${2}, ${3}) = $(version_cmp "${2}" "${3}")"
+  exit 0
+fi
+
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
@@ -84,7 +135,8 @@ installed_version() {
 normalize_version() {
   local v="${1#v}"
   v="${v//\~/-}"
-  v="$(printf '%s' "$v" | sed -E 's/^([0-9][^-]*[0-9])([A-Za-z].*)$/\1-\2/')"
+  # rc5 -> rc.5，保证 0.2.2rc5 与 0.2.2~rc.5 等价
+  v="$(printf '%s' "$v" | sed -E 's/([A-Za-z])([0-9])/\1.\2/g; s/^([0-9][^-]*[0-9])([A-Za-z].*)$/\1-\2/')"
   printf '%s' "$v"
 }
 
@@ -180,10 +232,19 @@ fi
 LATEST_VERSION="$(normalize_version "${TAG#v}")"
 CURRENT_KIND="$(installed_kind)"
 CURRENT_RAW="$(installed_version)"
+STATE_TAG=""
+if [[ -f "$STATE_DIR/installed.json" ]]; then
+  STATE_TAG="$(sed -n 's/.*"tag"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE_DIR/installed.json" | head -1)"
+fi
 CURRENT_VERSION="$(normalize_version "${CURRENT_RAW:-0.0.0}")"
 
 say "==> 当前安装：${CURRENT_RAW:-无}（格式：$CURRENT_KIND）"
 say "==> 上游最新：$TAG"
+
+if [[ -n "$STATE_TAG" && "$STATE_TAG" == "$TAG" ]]; then
+  say "==> 已是从 $TAG 装上的版本，无需升级"
+  exit 0
+fi
 
 if [[ -n "$CURRENT_RAW" && "$CURRENT_RAW" != appimage-unknown ]]; then
   cmp="$(version_cmp "$LATEST_VERSION" "$CURRENT_VERSION")"
