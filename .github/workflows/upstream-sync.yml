@@ -1,0 +1,131 @@
+name: upstream-sync
+
+# 跟上游 release（rc 与正式版）对齐：发现更新的 dsh-v* tag 时，改写 PKGBUILD 的
+# _tag/_commit/pkgver，先验证整条补丁系列还能打上，再提交并打一个 v<版本> tag。
+# 那个 tag 会触发 build.yml 的 tag 构建；构建成功后 auto-release.yml 负责签名与发版。
+# 补丁打不上时不提交，只开一个 issue，避免把坏版本推出去。
+
+on:
+  schedule:
+    - cron: '43 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取 PKGBUILD 当前跟踪的 tag
+        id: current
+        run: |
+          set -euo pipefail
+          tag="$(bash -c 'source ./PKGBUILD; printf "%s" "${_tag:-}"')"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "==> 当前跟踪：$tag"
+
+      - name: 拉取上游 release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api --paginate 'repos/deepseek-ai/deepseek-harness/releases?per_page=100' --jq '.[].tag_name' > upstream-tags.txt
+          wc -l upstream-tags.txt
+
+      - name: 选出新版本
+        id: pick
+        env:
+          CURRENT_TAG: ${{ steps.current.outputs.tag }}
+        run: node scripts/pick-upstream.mjs upstream-tags.txt "$CURRENT_TAG"
+
+      - name: 解析 tag 指向的 commit
+        id: sha
+        if: steps.pick.outputs.should_bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ref="$(gh api "repos/deepseek-ai/deepseek-harness/git/ref/tags/$UPSTREAM_TAG")"
+          type="$(jq -r '.object.type' <<<"$ref")"
+          sha="$(jq -r '.object.sha' <<<"$ref")"
+          hops=0
+          while [[ "$type" == 'tag' && $hops -lt 5 ]]; do
+            obj="$(gh api "repos/deepseek-ai/deepseek-harness/git/tags/$sha")"
+            type="$(jq -r '.object.type' <<<"$obj")"
+            sha="$(jq -r '.object.sha' <<<"$obj")"
+            hops=$((hops + 1))
+          done
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "无法解析 $UPSTREAM_TAG 的 commit" >&2; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "==> $UPSTREAM_TAG -> $sha"
+
+      - name: 改写 PKGBUILD
+        if: steps.pick.outputs.should_bump == 'true'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: ./scripts/bump-upstream.sh "$TAG" "$SHA" "$VERSION"
+
+      - name: 验证补丁系列仍可打上
+        id: verify
+        if: steps.pick.outputs.should_bump == 'true'
+        continue-on-error: true
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          ./scripts/fetch-upstream.sh --commit "$SHA" "$TAG"
+          ./scripts/apply-patches.sh --check
+
+      - name: 提交并打 tag
+        if: steps.pick.outputs.should_bump == 'true' && steps.verify.outcome == 'success'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          VERSION: ${{ steps.pick.outputs.version }}
+          RELEASE_TAG: ${{ steps.pick.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name 'WU-HINS bot'
+          git config user.email 'bot@wu-hins.dev'
+          git add PKGBUILD
+          git commit -m "chore: track upstream $TAG"
+          git tag "$RELEASE_TAG"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}" "$RELEASE_TAG"
+          echo "==> pushed $TAG ($RELEASE_TAG)"
+
+      - name: 补丁失效时开 issue
+        if: steps.pick.outputs.should_bump == 'true' && steps.verify.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          VERSION: ${{ steps.pick.outputs.version }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          title="补丁系列无法应用到上游 $TAG"
+          open="$(gh issue list --state open --limit 100 --json title --jq "[.[] | select(.title == \"$title\")] | length")"
+          if [[ "$open" != '0' ]]; then echo '已存在同名 issue，跳过'; exit 0; fi
+          {
+            echo "upstream-sync 在上游 $TAG（$VERSION）上试打 patches/*.patch 失败，已停止发版。"
+            echo
+            echo '本地复现：'
+            echo
+            echo '    ./scripts/fetch-upstream.sh --commit '\"$SHA\"' '$TAG
+            echo '    ./scripts/apply-patches.sh --check'
+            echo
+            echo "运行记录：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/issue.md
+          gh issue create --title "$title" --body-file /tmp/issue.md

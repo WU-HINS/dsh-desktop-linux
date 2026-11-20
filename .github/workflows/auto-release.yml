@@ -1,0 +1,91 @@
+name: auto-release
+
+# build-linux 成功后自动发版：下载该次 run 的产物 → SHA256SUMS → GPG 签名 → 更新清单
+# → 创建或补全 GitHub Release。只在 tag（v*）触发的构建上运行，手动 dispatch 的试验
+# 构建不会发版。
+
+on:
+  workflow_run:
+    workflows: [build-linux]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: auto-release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      TAG: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: 下载构建产物
+        run: |
+          set -euo pipefail
+          gh run download "$RUN_ID" -D artifacts
+          find artifacts -maxdepth 2 -type d | head -20
+
+      - name: 汇总产物与校验和
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          for pattern in '*.AppImage' '*.deb' '*.rpm' '*.pkg.tar.zst'; do
+            find artifacts -type f -name "$pattern" -exec cp -v {} dist/ \;
+          done
+          count=$(find dist -maxdepth 1 -type f | wc -l)
+          echo "==> 收集到 $count 个产物"
+          [[ "$count" -gt 0 ]] || { echo '没有可用产物' >&2; exit 1; }
+          (cd dist && sha256sum ./* > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          version="${TAG#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *rc* || "$version" == *alpha* || "$version" == *beta* ]]; then
+            echo 'prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: GPG 签名
+        if: env.GPG_PRIVATE_KEY != ''
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: ./scripts/sign-artifacts.sh dist
+
+      - name: 生成更新清单
+        env:
+          VERSION: ${{ steps.collect.outputs.version }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: node scripts/manifest.mjs dist "$RELEASE_TAG" "$VERSION"
+
+      - name: 发布 Release
+        env:
+          PRERELEASE: ${{ steps.collect.outputs.prerelease }}
+          VERSION: ${{ steps.collect.outputs.version }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=''
+          if [[ "$PRERELEASE" == 'true' ]]; then prerelease_flag='--prerelease'; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "DeepSeek Harness Linux $VERSION" \
+              --generate-notes $prerelease_flag
+          fi
